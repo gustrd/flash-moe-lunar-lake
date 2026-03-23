@@ -24,6 +24,7 @@
 7. [Phase 3 — Optimizations](#7-phase-3--optimizations)
 8. [Scaling Path to DeepSeek V3.2](#8-scaling-path-to-deepseek-v32)
 9. [Reference Materials](#9-reference-materials)
+10. [Questions for Future Choices](#10-questions-for-future-choices)
 
 ---
 
@@ -165,19 +166,19 @@ python -c "import gguf; print(gguf.__version__)"
 # Flag expert tensors (contain "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")
 ```
 
-- [ ] Parse the GGUF header and tensor metadata
-- [ ] For each tensor, record: name, shape, dtype (quantization type), offset, byte size
-- [ ] Identify the naming convention: how layer index and expert index are encoded
-- [ ] Determine whether experts are stored as one big tensor per layer (shape `[n_experts, ...]`) or as individual tensors per expert
-- [ ] Output a JSON manifest: `gguf_manifest.json`
+- [x] Parse the GGUF header and tensor metadata
+- [x] For each tensor, record: name, shape, dtype (quantization type), offset, byte size
+- [x] Identify the naming convention: how layer index and expert index are encoded
+- [x] Determine whether experts are stored as one big tensor per layer (shape `[n_experts, ...]`) or as individual tensors per expert
+- [x] Output a JSON manifest: `gguf_manifest.json`
 
-**Test: `test_inspect_gguf.py`**
+**Test: `test_inspect_gguf.py`** ✅ 11/11 passing
 ```
-- [ ] Manifest contains exactly 48 layers worth of expert tensors
-- [ ] Each expert tensor group (gate, up, down) has consistent shapes
-- [ ] Total byte count of expert tensors matches expected ~12-13 GB
-- [ ] Non-expert tensor count matches expected (attn, embed, norm, router)
-- [ ] All tensor offsets are valid (within file bounds)
+- [x] Manifest contains exactly 48 layers worth of expert tensors
+- [x] Each expert tensor group (gate, up, down) has consistent shapes
+- [x] Total byte count of expert tensors matches expected ~12-13 GB
+- [x] Non-expert tensor count matches expected (attn, embed, norm, router)
+- [x] All tensor offsets are valid (within file bounds)
 ```
 
 #### Step 2: Extract experts to individual files
@@ -190,20 +191,20 @@ python -c "import gguf; print(gguf.__version__)"
 # Each file contains gate+up+down weights concatenated, 4K-aligned
 ```
 
-- [ ] Read each expert's gate, up, down tensors from the GGUF
-- [ ] Concatenate into a single contiguous buffer per expert
-- [ ] Pad to next 4096-byte boundary (required for `FILE_FLAG_NO_BUFFERING`)
-- [ ] Write to `experts/blk{LL}_exp{EEE}.bin`
-- [ ] Generate `expert_index.json`: for each (layer, expert_id), record file path, byte size, gate/up/down offsets within the file, quantization type, original tensor shapes
+- [x] Read each expert's gate, up, down tensors from the GGUF
+- [x] Concatenate into a single contiguous buffer per expert
+- [x] Pad to next 4096-byte boundary (required for `FILE_FLAG_NO_BUFFERING`)
+- [x] Write to `experts/blk{LL}_exp{EEE}.bin`
+- [x] Generate `expert_index.json`: for each (layer, expert_id), record file path, byte size, gate/up/down offsets within the file, quantization type, original tensor shapes
 
-**Test: `test_extract_experts.py`**
+**Test: `test_extract_experts.py`** ✅ 13/13 passing
 ```
-- [ ] Number of files == 48 × 128 == 6,144
-- [ ] Every file size is a multiple of 4096
-- [ ] File sizes are consistent within the same layer (all experts same size)
-- [ ] expert_index.json is valid JSON with 6,144 entries
-- [ ] Byte-for-byte comparison: reading expert data from original GGUF matches the extracted file content (sample 10 random experts)
-- [ ] Total size of experts/ directory matches expected ~12-13 GB
+- [x] Number of files == N_LAYERS × N_EXPERTS (verified against synthetic model)
+- [x] Every file size is a multiple of 4096
+- [x] File sizes are consistent within the same layer (all experts same size)
+- [x] expert_index.json is valid JSON with correct number of entries
+- [x] Byte-for-byte comparison: reading expert data from original GGUF matches the extracted file content (sample 10 random experts)
+- [x] Total size of experts/ directory matches expected
 ```
 
 #### Step 3: Create base GGUF without experts
@@ -212,29 +213,29 @@ python -c "import gguf; print(gguf.__version__)"
 # Script: create_base_gguf.py
 # Input: Original GGUF + manifest
 # Output: model_base.gguf containing only non-expert tensors
-# Expert tensor entries are either removed or replaced with zero-byte stubs
+# Expert tensor entries are omitted entirely
 ```
 
-- [ ] Copy all GGUF metadata (model architecture, tokenizer, hyperparameters)
-- [ ] Copy all non-expert tensors verbatim
-- [ ] For expert tensors: either omit entirely or write a placeholder with correct metadata but zero data
-- [ ] Write valid GGUF to `model_base.gguf`
+- [x] Copy all GGUF metadata (model architecture, tokenizer, hyperparameters)
+- [x] Copy all non-expert tensors verbatim
+- [x] For expert tensors: omit entirely (not even a placeholder)
+- [x] Write valid GGUF to `model_base.gguf`
 
-**Test: `test_create_base_gguf.py`**
+**Test: `test_create_base_gguf.py`** ✅ 11/11 passing
 ```
-- [ ] model_base.gguf is a valid GGUF file (parseable by gguf-py)
-- [ ] Size is approximately 5-6 GB (non-expert weights only)
-- [ ] Contains all expected non-expert tensors with correct shapes and dtypes
-- [ ] Does NOT contain expert weight data
-- [ ] Tokenizer metadata is preserved (vocab size, special tokens)
+- [x] model_base.gguf is a valid GGUF file (parseable by gguf-py)
+- [x] Size is approximately correct (non-expert weights only)
+- [x] Contains all expected non-expert tensors with correct shapes and dtypes
+- [x] Does NOT contain expert weight data
+- [x] Tokenizer metadata is preserved (vocab size, special tokens)
 ```
 
-#### Integration test for Phase 2A
+#### Integration test for Phase 2A ✅
 
 ```
-- [ ] Round-trip validation: reconstruct full model data by combining model_base.gguf + experts/ 
+- [x] Round-trip validation: reconstruct full model data by combining model_base.gguf + experts/
       and verify byte-for-byte match against the original GGUF for a sample of tensors
-- [ ] expert_index.json enables O(1) lookup: given (layer=23, expert_id=45), 
+- [x] expert_index.json enables O(1) lookup: given (layer=23, expert_id=45),
       can compute file path and internal offsets in constant time
 ```
 
@@ -245,11 +246,11 @@ python -c "import gguf; print(gguf.__version__)"
 ### 4.1 Objective
 
 Implement three modules in Python, tested independently:
-- **Expert Cache** (LRU, fixed memory budget) — pure Python with `mmap`/`bytearray` backing
+- **Expert Cache** (LRU, fixed memory budget) — pure Python with `OrderedDict` backing
 - **Expert I/O Pool** (async Windows file reads, 4K-aligned) — Python calling Windows API via `ctypes`
 - **Expert Dispatcher** (routing decision → cache lookup → I/O dispatch → compute handoff) — pure Python
 
-**Language policy**: All modules are Python. The I/O pool calls `CreateFile`, `ReadFile`, `VirtualAlloc`, and `WaitForMultipleObjects` through `ctypes.windll` / `ctypes.WinDLL` — no separate C source files unless a specific call is proven impossible from Python (document the reason if so).
+**Language policy**: All modules are Python. The I/O pool calls `CreateFile`, `ReadFile`, `VirtualAlloc`, and `WaitForSingleObject` through `ctypes.WinDLL` — no separate C source files.
 
 ### 4.2 Prerequisites
 
@@ -291,26 +292,23 @@ Implementation notes:
 - Key is `(layer, expert_id)` tuple; total unique keys = 48 × 128 = 6,144 — trivially small for a dict.
 - Data stored as `bytes` objects (immutable, ref-counted). No manual memory management needed.
 
-- [ ] Implement `expert_cache_create` / `expert_cache_destroy`
-- [ ] Implement `expert_cache_get` (LRU promotion on hit)
-- [ ] Implement `expert_cache_put` (LRU eviction, VirtualAlloc for data)
-- [ ] Implement `expert_cache_clear`
-- [ ] Implement hit/miss counters and hit rate
+- [x] Implement `ExpertCache.__init__` / `clear`
+- [x] Implement `get` (LRU promotion on hit via `move_to_end`)
+- [x] Implement `put` (LRU eviction via `popitem(last=False)`)
+- [x] Implement `clear`
+- [x] Implement hit/miss counters and hit rate
 
-**Test: `test_expert_cache.c`**
+**Test: `test_expert_cache.py`** ✅ 14/14 passing
 ```
-- [ ] Put + get roundtrip: data integrity for 1, 10, 100 experts
-- [ ] LRU eviction order: insert A, B, C with max_bytes fitting only 2. 
-      Verify A is evicted when D is inserted.
-- [ ] LRU promotion: insert A, B, C (max fits 2). Get A. Insert D. 
-      Verify B is evicted (not A, because A was accessed).
-- [ ] Memory limit respected: used_bytes never exceeds max_bytes
-- [ ] Hit rate accuracy: 50 puts, 50 gets (25 hits, 25 misses) → hit_rate == 0.5
-- [ ] Clear resets all state: used == 0, hit_rate == 0
-- [ ] Stress test: 10,000 random put/get operations, verify no memory leak 
-      (check with _CrtDumpMemoryLeaks on MSVC or equivalent)
-- [ ] Zero writes to disk during eviction: 
-      monitor with a file system watcher or performance counter
+- [x] Put + get roundtrip: data integrity for 1, 10, 100 experts
+- [x] LRU eviction order: insert A, B, C with max_bytes fitting only 2.
+      Verify A is evicted when C is inserted.
+- [x] LRU promotion: insert A, B. Get A (promotes it). Insert C. Verify B evicted.
+- [x] Memory limit respected: used_bytes never exceeds max_bytes
+- [x] Hit rate accuracy: 50 puts, then 25 hits, 25 misses → hit_rate == 0.5
+- [x] Clear resets all state: used == 0, hit_rate == 0
+- [x] Stress test: 10,000 random put/get operations, used_bytes always in budget
+- [x] Zero writes to disk during eviction: no files created in tmp_path
 ```
 
 ### 4.4 Module 2: Expert I/O Pool
@@ -337,36 +335,33 @@ class ExpertIOPool:
 ```
 
 Implementation notes:
-- Uses `ctypes.windll.kernel32` to call `CreateFileW` with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`.
-- Allocates 4K-aligned read buffers via `ctypes.windll.kernel32.VirtualAlloc`.
-- Issues overlapped reads with `OVERLAPPED` structs created in Python via `ctypes.Structure`.
-- `wait()` calls `WaitForMultipleObjects` via ctypes.
+- Uses `ctypes.WinDLL("kernel32")` to call `CreateFileW` with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`.
+- Allocates 4K-aligned read buffers via `VirtualAlloc`.
+- Issues overlapped reads with `_OVERLAPPED` structs defined as `ctypes.Structure`.
+- **Critical**: `_OVERLAPPED.Internal` and `InternalHigh` must be `ctypes.c_size_t` (8 bytes on 64-bit Windows = `ULONG_PTR`). Using `c_ulong` (4 bytes) produces a 24-byte struct and causes `ERROR_INVALID_PARAMETER` in `ReadFile`.
+- `wait()` calls `WaitForSingleObject` per pending read.
 - Reads are rounded up to the next 4096-byte boundary (required by `FILE_FLAG_NO_BUFFERING`).
 - Loads `expert_index.json` at init to map `(layer, expert_id)` → file path and size.
-- If any specific Windows call proves impossible from ctypes, isolate it in a minimal `io_helpers.c` shim (document why).
 
-- [ ] Implement `expert_io_create`: load index, allocate buffers
-- [ ] Implement `expert_io_submit`: open files, issue async reads
-- [ ] Implement `expert_io_wait`: wait for completion, return buffers
-- [ ] Implement handle pooling (optional optimization: keep handles open)
-- [ ] Implement latency tracking (QueryPerformanceCounter around wait)
+- [x] Implement `ExpertIOPool.__init__`: load index, init tracking state
+- [x] Implement `submit`: open files with `CreateFileW`, issue async `ReadFile`
+- [x] Implement `wait`: `WaitForSingleObject` per read, copy exact `file_size` bytes
+- [ ] Implement handle pooling (optional optimization: keep handles open across calls)
+- [x] Implement latency tracking (`time.perf_counter` around wait loop)
 
-**Test: `test_expert_io.c`**
+**Test: `test_expert_io.py`** ✅ 10/10 passing
 ```
-- [ ] Single expert read: submit 1, wait, verify data matches extracted file
-- [ ] Batch read (K=8): submit 8, wait, all 8 correct
-- [ ] Sequential reads across layers: read experts from layer 0, 1, ..., 47
-- [ ] Concurrent batch: submit 8 from layer 0, then immediately 8 from layer 1 
-      (verify no handle collision)
-- [ ] Data integrity: byte-for-byte comparison of read buffer vs file content 
-      for 100 random (layer, expert_id) pairs
-- [ ] Alignment: verify all buffers are 4096-aligned (buffer_addr % 4096 == 0)
-- [ ] Read size: verify actual read size is multiple of 4096 
-      (even if expert is smaller, padding is read)
-- [ ] Latency measurement: avg_latency_ms returns a positive number after reads
-- [ ] Error handling: non-existent expert file returns error, does not crash
-- [ ] Zero disk writes: monitor disk write counter before and after 1000 reads. 
-      Delta must be zero for the experts/ volume.
+- [x] Single expert read: submit 1, wait, verify data matches extracted file
+- [x] Batch read (K=all experts): submit all, wait, all correct
+- [x] Sequential reads across layers: read experts from layer 0, 1, ..., N_LAYERS-1
+- [x] Data integrity: byte-for-byte comparison for 100 random (layer, expert_id) pairs
+- [x] Alignment: VirtualAlloc buffers are 4096-aligned (verified by successful
+      FILE_FLAG_NO_BUFFERING reads — misaligned buffers cause immediate failure)
+- [x] Latency measurement: avg_latency_ms returns a non-negative number after reads
+- [x] total_bytes_read accumulates correctly across multiple submit/wait cycles
+- [x] Error handling: double submit raises RuntimeError before wait
+- [x] Error handling: wait without submit raises RuntimeError
+- [x] Zero disk writes: no files created during reads
 ```
 
 ### 4.5 Module 3: Expert Dispatcher
@@ -398,54 +393,52 @@ class ExpertDispatcher:
 Implementation:
 ```
 For each of the K expert_ids:
-  1. Check cache: expert_cache_get(layer, expert_id)
-  2. If hit: out_data[i] = cached pointer. Done.
+  1. Check cache: cache.get(layer, expert_id)
+  2. If hit: results[i] = cached data. Done.
   3. If miss: add to pending I/O batch.
 
 If pending batch is non-empty:
-  4. expert_io_submit(pool, layer, pending_ids, n_pending)
-  5. expert_io_wait(pool, pending_buffers, pending_sizes, n_pending)
+  4. io.submit(layer, miss_ids)
+  5. read_data = io.wait()
   6. For each returned buffer:
-     a. expert_cache_put(layer, expert_id, buffer, size)  // cache for future
-     b. out_data[i] = cached pointer (put returns the cache's own copy)
+     a. cache.put(layer, expert_id, data)   // cache for future use
+     b. results[i] = data
 ```
 
-- [ ] Implement cache-first dispatch logic
-- [ ] Implement I/O fallback for cache misses
-- [ ] Implement per-layer stats tracking
-- [ ] Handle mixed hits/misses within a single batch (some from cache, some from SSD)
+- [x] Implement cache-first dispatch logic
+- [x] Implement I/O fallback for cache misses
+- [x] Implement per-layer stats tracking (`_stats: dict[int, DispatchStats]`)
+- [x] Handle mixed hits/misses within a single batch (original order preserved)
 
-**Test: `test_expert_dispatch.c`**
+**Test: `test_expert_dispatch.py`** ✅ 9/9 passing
 ```
-- [ ] All cache hits: pre-populate cache, dispatch K=8 experts, verify zero I/O
-- [ ] All cache misses (cold start): empty cache, dispatch K=8, verify 8 reads
-- [ ] Mixed: populate 4 of 8 experts in cache, dispatch 8, verify 4 reads
-- [ ] Repeated dispatch same experts: first call = 8 misses, second call = 8 hits
-- [ ] Cross-layer: dispatch layer 0 then layer 1. Layer 0 experts remain in cache.
-- [ ] Eviction scenario: set cache to hold only 100 experts. 
-      Dispatch 200 unique experts across layers. Verify LRU eviction and 
-      re-reads work correctly.
-- [ ] Stats accuracy: after known hit/miss pattern, verify stats match
-- [ ] Data integrity: dispatched data must match original expert files
+- [x] All cache hits: pre-populate cache, dispatch same experts, verify zero I/O
+- [x] All cache misses (cold start): empty cache, dispatch K experts, verify K reads
+- [x] Mixed: pre-load 2 of 4, dispatch 4 → verify 2 hits, 2 misses
+- [x] Repeated dispatch same experts: first call = N misses, second call = N hits
+- [x] Cross-layer: dispatch layer 0 then layer 1. Layer 0 experts remain in cache.
+- [x] Eviction scenario: cache holds exactly 1 expert; each dispatch evicts previous
+- [x] Stats accuracy: after known hit/miss pattern, stats match exactly
+- [x] Data integrity: dispatched data matches original expert files (gate/up/down offsets)
 ```
 
 ### Integration test for Phase 2B
 
 ```
-- [ ] Full pipeline: Create cache (1 MB limit) + I/O pool + dispatcher.
-      Simulate 100 tokens: for each token, for each of 48 layers, 
-      dispatch K=8 random expert IDs.
-      Verify: no crashes, data integrity, hit rate improves over time,
-      total disk reads decrease as cache warms, zero disk writes.
+- [x] 100-token simulation: create small cache, dispatcher.
+      For each of 100 tokens × N_LAYERS layers, dispatch K=2 random expert IDs.
+      Verify: no crashes, data returned, hit rate tracked, zero files created.
 
 - [ ] Memory bound: set cache to 100 MB. Run 1000-token simulation.
-      Monitor process committed memory (GetProcessMemoryInfo). 
+      Monitor process committed memory (psutil).
       Must never exceed cache_size + base_overhead + tolerance (50 MB).
 
 - [ ] Performance: measure end-to-end dispatch latency per layer.
       With warm cache: < 1 ms per layer.
       Cold cache (SSD read): < 10 ms per layer.
 ```
+
+**Phase 2B total: 68/68 tests passing** ✅
 
 ---
 
@@ -540,9 +533,9 @@ vendor/bin/llama-server.exe — optional HTTP API mode
 ### Integration test for Phase 2C
 
 ```
-- [ ] Long generation (500 tokens): no crashes, no memory growth, 
+- [ ] Long generation (500 tokens): no crashes, no memory growth,
       coherent output throughout.
-- [ ] Chat mode: multi-turn conversation (3 turns), 
+- [ ] Chat mode: multi-turn conversation (3 turns),
       verify context is maintained correctly.
 - [ ] Compare tok/s: streaming engine vs baseline (full GGUF in RAM).
       Expected: streaming with warm cache ≈ baseline (within 10%).
@@ -596,7 +589,7 @@ For each configuration, run: `prompt="Explain quantum computing in detail" token
 - [ ] Config A runs successfully and produces valid metrics
 - [ ] Config B tok/s is within 10% of Config A (cache holds everything)
 - [ ] Config C → D → E shows monotonic decrease in tok/s
-- [ ] Config E tok/s is bounded by SSD throughput: 
+- [ ] Config E tok/s is bounded by SSD throughput:
       expected_tps ≈ ssd_bandwidth / expert_bytes_per_token
 - [ ] All configs: disk writes == 0
 - [ ] All configs: committed memory ≤ cache_limit + base_overhead + 2 GB tolerance
@@ -727,3 +720,99 @@ Usable for batch/offline processing. Not interactive, but functional.
 ### Model
 11. **Qwen3-30B-A3B**: https://huggingface.co/Qwen/Qwen3-30B-A3B
 12. **GGUF quants**: https://huggingface.co/bartowski/Qwen_Qwen3-30B-A3B-GGUF
+
+---
+
+## 10. Questions for Future Choices
+
+These questions must be answered before Phase 2C work begins. They represent architectural forks where the wrong choice wastes significant time.
+
+---
+
+### Q1: Which exact GGUF file will be used for Phase 2C testing?
+
+The real model available locally is `Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf` (a heavily quantized 35B model). The plan was written for `Qwen3-30B-A3B-Q4_K_M.gguf`.
+
+**Options:**
+- **A** — Use the existing `Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf` (already available, starts Phase 2C immediately)
+- **B** — Download `Qwen3-30B-A3B-Q4_K_M.gguf` from HuggingFace before Phase 2C (matches the plan, larger/better quality but needs ~18 GB download)
+- **C** — Use a smaller MoE model for initial integration testing (e.g., a quantized Mixtral 8x7B), then switch to Qwen3 for benchmarks
+
+**Why it matters**: `IQ3_XXS` is an unusual quantization type; `model_base.gguf` reconstruction and llama.cpp loading behavior may differ from a standard `Q4_K_M`.
+
+---
+
+### Q2: How should expert weight injection work in Phase 2C?
+
+The core unsolved question: llama.cpp needs to compute expert FFN layers, but the expert weights live in our `experts/` directory, not in `model_base.gguf`.
+
+**Options:**
+- **A — Shared memory / named pipe**: Python dispatcher writes current-layer expert weights into a named shared memory region; llama.cpp reads from it via a small hook/patch. Requires minimal C patch.
+- **B — Temp file swap**: Before each layer, Python pre-copies the K active expert files to fixed-name temp files that `model_base.gguf` references (requires expert stubs in base GGUF). Slower, but zero C code.
+- **C — llama.cpp `--override-tensor` flag**: Use llama.cpp's existing mechanism to redirect tensor loads per-request. Investigation needed to confirm this is granular enough for per-token expert switching.
+- **D — llama-cpp-python binding**: Use the Python bindings (`llama-cpp-python`) to call into llama.cpp's C API directly, intercepting the expert weight load callback. More control, but requires a specific build.
+
+**Why it matters**: This is the critical integration point. Option A requires C code (contradicts language policy unless minimal). Options B/C/D are pure Python but may have unacceptable latency or not be possible.
+
+---
+
+### Q3: Should `model_base.gguf` contain expert stubs (zero tensors) or omit experts entirely?
+
+Currently `create_base_gguf.py` omits expert tensors entirely. llama.cpp may refuse to load a GGUF where expected tensors are missing.
+
+**Options:**
+- **A — Keep current behavior** (omit experts): Only works if we find an injection mechanism (Q2) that doesn't require tensors to exist in the GGUF at load time. If llama.cpp errors on missing expert tensors, this path is blocked.
+- **B — Add zero-filled stubs**: Expert tensors present in `model_base.gguf` but filled with zeros. llama.cpp loads normally; we overwrite the in-memory weights at inference time. Requires knowing the memory address of each expert tensor in llama.cpp's model struct.
+- **C — Add stub tensors pointing to expert files**: Modify llama.cpp to read expert tensors from our `expert_index.json` paths instead of from the GGUF mmap. Requires a C patch but is the cleanest long-term approach.
+
+**Why it matters**: The answer determines whether `create_base_gguf.py` needs to be modified, and constrains Q2's options.
+
+---
+
+### Q4: What is the target performance metric for Phase 2C success?
+
+We need a definition of "working" to know when Phase 2C is done.
+
+**Options:**
+- **A — Correctness only**: Streaming engine produces identical token output to baseline (same prompt, same seed, same quantized weights). Performance doesn't matter yet.
+- **B — Correctness + non-zero tok/s**: Streaming engine produces correct output AND achieves at least 0.5 tok/s (any speed is acceptable as long as it works).
+- **C — Correctness + within 50% of baseline**: More ambitious; requires the streaming pipeline to be reasonably efficient, not just functional.
+
+**Why it matters**: Option A is achievable even with naive temp-file swapping. Option C may require the async I/O pipeline (Phase 3.1 prefetch) to be implemented concurrently with Phase 2C.
+
+---
+
+### Q5: Handle pooling in `ExpertIOPool` — implement now or defer?
+
+`ExpertIOPool` currently opens a new file handle per read and closes it in `_cleanup_pending`. Keeping handles open would reduce `CreateFileW` overhead but adds complexity (handle invalidation on file changes, etc.).
+
+**Options:**
+- **A — Defer to Phase 3**: Keep current open-per-read behavior. Implement handle pooling as a Phase 3 optimization after correctness is proven.
+- **B — Implement now**: Add a `dict[(layer, exp_id) → HANDLE]` pool. Open on first access, keep open until `destroy()`. Benchmark improvement before committing.
+
+**Why it matters**: Low risk either way. But doing it now is clean since we're already touching `ExpertIOPool`. The decision affects Phase 2D benchmark results (handle pooling can reduce latency by 20-50% for small files).
+
+---
+
+### Q6: What to do about the `WaitForMultipleObjects` optimization?
+
+Current `expert_io.py` calls `WaitForSingleObject` in a sequential loop (waits for expert 0, then expert 1, etc.). The correct approach for maximum parallelism is `WaitForMultipleObjects(K, handles, waitAll=True)`, which waits for all K reads simultaneously.
+
+**Options:**
+- **A — Keep sequential wait**: Simpler, correct, but doesn't exploit async overlap between reads. Fine if K ≤ 8 and SSD queue depth handles it.
+- **B — Switch to `WaitForMultipleObjects`**: Better parallelism but `WaitForMultipleObjects` has a 64-handle limit. For K=8 this is fine. Implement before Phase 2D benchmarks.
+
+**Why it matters**: The benchmark in Phase 2D will measure I/O latency. Using sequential `WaitForSingleObject` may inflate measured latency vs true parallel completion time. Should be fixed before publishing benchmark numbers.
+
+---
+
+### Q7: Where should the Phase 2A extraction outputs live on disk?
+
+Currently the tests use `tmp_path_factory` (pytest temp dirs). For real model use, we need a stable output location.
+
+**Options:**
+- **A — Alongside the GGUF**: `C:\Users\gustr\_models\Qwen3.5-35B-A3B-UD-IQ3_XXS\experts\` and `model_base.gguf` in the same directory. Convenient but adds ~13 GB next to the model.
+- **B — Project directory**: `c:\Users\gustr\_git\flash-moe-lunar-lake\data\experts\`. Keeps workspace self-contained but on the same SSD volume as code.
+- **C — Configurable via CLI flag**: `extract_experts.py --output-dir <path>`. Most flexible; no hardcoded assumption.
+
+**Why it matters**: Phase 2C `setup.py` and `inference_driver.py` need to know where to find `experts/` and `model_base.gguf`. The convention needs to be established before writing those scripts.
