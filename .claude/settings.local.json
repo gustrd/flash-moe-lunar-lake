@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "Bash(ls:*)",
+      "Bash(cmd.exe /c \"where python\")",
+      "Bash(python.exe -c \"import gguf; print\\(gguf.__version__\\)\" 2>&1)",
+      "Bash(python.exe -m pip install gguf numpy)",
+      "Bash(python.exe create_base_gguf.py 'C:\\\\Users\\\\gustr\\\\_models\\\\Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf' -o 'C:\\\\Users\\\\gustr\\\\_models\\\\Qwen3-30B-A3B-Instruct-2507-Q4_K_M\\\\model_base.gguf' 2>&1)",
+      "Bash(cmd.exe /c \"C:\\\\Users\\\\gustr\\\\_git\\\\flash-moe-lunar-lake\\\\vendor\\\\bin\\\\llama-cli.exe -m C:\\\\Users\\\\gustr\\\\_models\\\\Qwen3-30B-A3B-Instruct-2507-Q4_K_M\\\\model_base.gguf -p Hello -n 1\")",
+      "WebFetch(domain:github.com)",
+      "WebSearch"
+    ]
+  }
+}

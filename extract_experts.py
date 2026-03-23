@@ -28,7 +28,16 @@ Also writes  experts/expert_index.json  with an O(1) lookup table:
         "down_shape":    [int],
       }
     }
-  }
+      "token_id":    int,    # reserved token ID for the expert-selector IPC channel
+    }
+  },
+  "token_id_base": int,    # first token_id used (= vocab_size from KV metadata, or fallback)
+  "token_id_count": int,   # total reserved IDs (= n_layers * n_experts)
+}
+
+token_id assignment:  token_id = token_id_base + layer * n_experts + expert_id
+This is a stable 1-to-1 mapping used by inference_driver.py so Instance A can communicate
+selected expert IDs to Instance B via the llama.cpp token stream.
 
 n_experts is inferred as  shape[-1]  of any merged expert tensor
 (GGUF stores the numpy first-dimension last in the shape array).
@@ -49,6 +58,34 @@ import gguf
 from inspect_gguf import inspect_gguf
 
 _ALIGN = 4096  # FILE_FLAG_NO_BUFFERING sector size
+
+
+def _get_vocab_size(gguf_path: Path) -> int | None:
+    """Read vocab_size from the GGUF KV metadata without a full re-scan."""
+    reader = gguf.GGUFReader(str(gguf_path))
+    arch: str | None = None
+    if "general.architecture" in reader.fields:
+        f = reader.fields["general.architecture"]
+        arch = bytes(f.parts[f.data[0]]).decode("utf-8")
+    candidates = []
+    if arch:
+        candidates.append(f"{arch}.vocab_size")
+    candidates.extend(["tokenizer.ggml.tokens", "llama.vocab_size", "vocab_size"])
+    # Check direct integer KV fields first
+    for key in candidates[:2]:
+        if key in reader.fields:
+            f = reader.fields[key]
+            if hasattr(f.parts[f.data[0]], '__len__'):
+                return len(f.data)   # array → length is vocab size
+            try:
+                return int(f.parts[f.data[0]][0])
+            except (IndexError, TypeError):
+                pass
+    # Fall back: count tokenizer token array
+    if "tokenizer.ggml.tokens" in reader.fields:
+        f = reader.fields["tokenizer.ggml.tokens"]
+        return len(f.data)
+    return None
 
 
 def _pad_to_align(data: bytes, align: int = _ALIGN) -> bytes:
@@ -121,6 +158,11 @@ def extract_experts(
         )
     n_experts = n_experts_inferred
 
+    # ── Determine token_id_base from vocab_size metadata ─────────────────────
+    # We read the raw GGUF KV to get vocab_size without importing the full reader again.
+    # Fall back to a safe large offset if vocab_size is not found.
+    _token_id_base = _get_vocab_size(gguf_path) or 200_000
+
     # ── Open GGUF file for raw byte access ───────────────────────────────────
     raw_file = open(gguf_path, "rb")
 
@@ -171,6 +213,7 @@ def extract_experts(
                 out_path = experts_dir / fname
                 out_path.write_bytes(padded)
 
+                token_id = _token_id_base + layer * n_experts + exp_id
                 index_entries[f"{layer}_{exp_id}"] = {
                     "file":        fname,
                     "file_size":   len(padded),
@@ -184,6 +227,7 @@ def extract_experts(
                     "gate_shape":  gate_shape,
                     "up_shape":    up_shape,
                     "down_shape":  down_shape,
+                    "token_id":    token_id,
                 }
 
             if verbose:
@@ -197,9 +241,11 @@ def extract_experts(
         print(file=sys.stderr)
 
     expert_index = {
-        "n_layers":  n_layers,
-        "n_experts": n_experts,
-        "experts":   index_entries,
+        "n_layers":       n_layers,
+        "n_experts":      n_experts,
+        "token_id_base":  _token_id_base,
+        "token_id_count": n_layers * n_experts,
+        "experts":        index_entries,
     }
 
     index_path = experts_dir / "expert_index.json"

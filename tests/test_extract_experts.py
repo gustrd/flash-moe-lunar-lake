@@ -127,6 +127,40 @@ def test_o1_lookup(extracted):
     assert info["file"] == f"blk{layer:02d}_exp{exp:03d}.bin"
 
 
+def test_token_id_present_in_all_entries(extracted):
+    """Every expert entry must have a token_id field."""
+    experts_dir, index = extracted
+    for key, info in index["experts"].items():
+        assert "token_id" in info, f"Missing token_id for expert {key}"
+
+
+def test_token_ids_unique(extracted):
+    """All token_ids across all experts must be distinct."""
+    experts_dir, index = extracted
+    ids = [info["token_id"] for info in index["experts"].values()]
+    assert len(ids) == len(set(ids)), "Duplicate token_ids found"
+
+
+def test_token_id_formula(extracted):
+    """token_id = token_id_base + layer * n_experts + expert_id (stable formula)."""
+    experts_dir, index = extracted
+    base = index["token_id_base"]
+    n    = index["n_experts"]
+    for layer in range(N_LAYERS):
+        for exp in range(N_EXPERTS):
+            expected = base + layer * n + exp
+            actual   = index["experts"][f"{layer}_{exp}"]["token_id"]
+            assert actual == expected, f"Wrong token_id for ({layer},{exp}): {actual} != {expected}"
+
+
+def test_index_has_token_id_meta(extracted):
+    """expert_index.json must include token_id_base and token_id_count."""
+    experts_dir, index = extracted
+    assert "token_id_base" in index
+    assert "token_id_count" in index
+    assert index["token_id_count"] == N_LAYERS * N_EXPERTS
+
+
 def test_total_expert_dir_size_positive(extracted):
     experts_dir, index = extracted
     total = sum((experts_dir / info["file"]).stat().st_size

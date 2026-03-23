@@ -89,7 +89,12 @@ def create_base_gguf(
 ) -> None:
     """
     Write a GGUF to *output_path* containing all non-expert tensors and
-    metadata from *gguf_path*, with expert tensors omitted.
+    metadata from *gguf_path*.  Expert tensors are included as minimal
+    1-element F32 stubs (4 bytes each) to satisfy llama.cpp's tensor
+    name presence check while keeping the file as small as possible.
+
+    At inference time the streaming engine replaces expert computation
+    entirely — the stubs are never used for actual math.
 
     Parameters
     ----------
@@ -106,14 +111,15 @@ def create_base_gguf(
 
     arch = manifest.get("arch") or "llama"
     non_expert = manifest["non_expert_tensors"]
-    expert_names = {t["name"] for t in manifest["expert_tensors"]}
+    expert_tensors = manifest["expert_tensors"]
+    expert_names = {t["name"] for t in expert_tensors}
 
     if verbose:
-        print(f"Source:          {gguf_path}", file=sys.stderr)
-        print(f"Output:          {output_path}", file=sys.stderr)
-        print(f"Arch:            {arch}", file=sys.stderr)
+        print(f"Source:             {gguf_path}", file=sys.stderr)
+        print(f"Output:             {output_path}", file=sys.stderr)
+        print(f"Arch:               {arch}", file=sys.stderr)
         print(f"Non-expert tensors: {len(non_expert)}", file=sys.stderr)
-        print(f"Expert tensors omitted: {len(expert_names)}", file=sys.stderr)
+        print(f"Expert stubs:       {len(expert_names)} (minimal 4-byte each)", file=sys.stderr)
 
     reader = gguf.GGUFReader(str(gguf_path))
     writer = gguf.GGUFWriter(str(output_path), arch=arch)
@@ -121,36 +127,40 @@ def create_base_gguf(
     # ── Copy KV metadata ─────────────────────────────────────────────────────
     _copy_kv_fields(reader, writer)
 
-    # ── Copy non-expert tensors verbatim ──────────────────────────────────────
+    # ── Copy non-expert tensors verbatim; write zero stubs for experts ────────
     # We use the raw file for reading tensor bytes (avoids numpy type juggling
     # with quantized data) and add_tensor with raw_dtype to write them back.
+    #
+    # Shape note: GGUFWriter stores tensor shapes reversed vs numpy convention.
+    # GGUFReader returns them already in file order (reversed vs numpy).
+    # add_tensor with raw_dtype=uint8 expects:
+    #   raw_shape[-1] = numpy_last_dim * type_size // block_size  (bytes)
+    # Formula: byte_shape = [*numpy_shape[:-1], numpy_last * type_size // block_size]
     raw_file = open(gguf_path, "rb")
     try:
         for t in reader.tensors:
-            if t.name in expert_names:
-                continue  # omit expert tensors
-
-            raw_file.seek(t.data_offset)
-            raw_bytes = raw_file.read(t.n_bytes)
-
-            # GGUFWriter stores tensor shapes reversed vs numpy convention.
-            # GGUFReader returns them already reversed (i.e. in file order).
-            # add_tensor with raw_dtype=uint8 calls:
-            #   quant_shape_from_byte_shape(raw_shape, dtype)
-            # where raw_shape[-1] must be the last dimension in BYTES.
-            # Formula: byte_last = numpy_last * type_size // block_size
-            # where numpy_shape = list(reversed(reader_shape)).
             qt = gguf.GGMLQuantizationType(t.tensor_type)
             block_size, type_size = GGML_QUANT_SIZES[qt]
             numpy_shape = list(reversed([int(x) for x in t.shape]))
             byte_last   = numpy_shape[-1] * type_size // block_size
             byte_shape  = [*numpy_shape[:-1], byte_last]
 
-            arr = np.frombuffer(raw_bytes, dtype=np.uint8)
-            writer.add_tensor(t.name, arr, raw_shape=byte_shape, raw_dtype=qt)
-
-            if verbose:
-                print(f"  + {t.name}", file=sys.stderr)
+            if t.name in expert_names:
+                # Minimal stub: single F32 zero (4 bytes).
+                # Preserves tensor name so llama.cpp's presence check passes.
+                # Shape and type differ from the original — if llama.cpp
+                # validates shape/type, we'll need full stubs (Phase 2C gate).
+                stub = np.zeros(1, dtype=np.float32)
+                writer.add_tensor(t.name, stub)
+                if verbose:
+                    print(f"  ~ {t.name}  [4 B stub, was {t.n_bytes:,} B]", file=sys.stderr)
+            else:
+                raw_file.seek(t.data_offset)
+                raw_bytes = raw_file.read(t.n_bytes)
+                arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+                writer.add_tensor(t.name, arr, raw_shape=byte_shape, raw_dtype=qt)
+                if verbose:
+                    print(f"  + {t.name}", file=sys.stderr)
     finally:
         raw_file.close()
 
@@ -161,13 +171,14 @@ def create_base_gguf(
 
     if verbose:
         size_mb = output_path.stat().st_size / 1024 / 1024
-        print(f"\nmodel_base.gguf written: {size_mb:.1f} MB", file=sys.stderr)
+        print(f"\nmodel_base.gguf written: {size_mb:.1f} MB  (minimal expert stubs)",
+              file=sys.stderr)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def _cli() -> None:
     parser = argparse.ArgumentParser(
-        description="Create model_base.gguf (non-expert tensors only) from a pre-quantized GGUF."
+        description="Create model_base.gguf (non-expert tensors + minimal stubs) from a pre-quantized GGUF."
     )
     parser.add_argument("gguf_path", type=Path)
     parser.add_argument("--output", "-o", type=Path, default=Path("model_base.gguf"))

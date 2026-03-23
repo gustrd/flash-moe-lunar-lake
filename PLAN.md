@@ -527,19 +527,48 @@ vendor/bin/llama-server.exe — optional HTTP API mode
 
 #### Step 1: Obtain llama.cpp binaries
 
-- [ ] Write `setup.py`: fetch latest Vulkan release zip from `https://github.com/ggml-org/llama.cpp/releases`, verify SHA256, extract to `vendor/bin/`
-- [ ] Add `vendor/llama.cpp` as a git submodule pinned to the same tag as the downloaded binaries
+- [x] Write `setup.py`: fetch latest Vulkan release zip from `https://github.com/ggml-org/llama.cpp/releases`, verify SHA256, extract to `vendor/bin/`
+- [ ] Add `vendor/llama.cpp` as git submodule → see Step 2 decision (forking koboldcpp instead of upstream llama.cpp)
 - [ ] Verify baseline: `vendor/bin/llama-bench.exe -m <baseline_gguf> -ngl 99 -p 512 -n 128`
 - [ ] Record baseline tok/s (pp and tg) against `Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf`
 
-#### Step 2: Determine expert injection mechanism
+#### Step 2: Determine expert injection mechanism ✅ DECISION RESOLVED
 
-Before writing `inference_driver.py`, determine whether the binary supports loading `model_base.gguf` (missing expert tensors) without crashing:
+**Findings (tested 2026-03-23):**
 
-- [ ] Test: run `llama-cli.exe --model model_base.gguf` — does it error on missing expert tensors?
-- [ ] If it crashes: update `create_base_gguf.py` to include zero-filled expert stub tensors
-- [ ] If stubs needed: write the smallest possible patch to llama.cpp to overwrite stub tensors with dispatcher-provided data at inference time; document why
-- [ ] Decision gate: document chosen injection path before proceeding to Step 3
+Three approaches were evaluated:
+
+| Option | model_base.gguf size | Result |
+|--------|---------------------|--------|
+| A. Omit experts entirely | ~957 MB | llama.cpp "missing tensor" error |
+| B. Full-size zero stubs (original impl) | ~18 GB | Loads, but defeats memory budget |
+| C. Minimal 4-byte F32 stubs (implemented) | ~957 MB | `check_tensor_dims` shape mismatch error |
+
+**Test run (Option C):**
+```
+llama-cli.exe -m model_base.gguf -p Hello -n 1
+→ check_tensor_dims: tensor 'blk.0.ffn_gate_exps.weight' has wrong shape;
+  expected 2048, 768, 128, got 1, 1, 1, 1
+```
+
+Stock llama.cpp validates tensor shapes at load time (not just names), so any stub
+with wrong shape/size is rejected.
+
+**Decision: Fork koboldcpp as vendor/llama.cpp submodule.**
+- Base: `https://github.com/gustrd/koboldcpp` branch `master`
+- Our branch: `flash-moe` (to be created)
+- Patch: skip `check_tensor_dims` for tensors matching `ffn_*_exps` pattern,
+  so minimal 4-byte stubs pass shape validation.
+- model_base.gguf stays at ~957 MB with Option C stubs. ✅
+
+**Steps:**
+- [x] Implement Option C minimal stubs in `create_base_gguf.py`
+- [x] Regenerate model_base.gguf → 957 MB (was ~18 GB)
+- [x] Confirm llama.cpp rejects due to `check_tensor_dims` shape check
+- [ ] Add `https://github.com/gustrd/koboldcpp` as `vendor/llama.cpp` submodule on branch `flash-moe`
+- [ ] Patch `check_tensor_dims` (or equivalent) to skip shape validation for expert tensors
+- [ ] Build patched binary (Vulkan, Windows) → `vendor/bin/`
+- [ ] Verify model_base.gguf loads cleanly with patched binary
 
 #### Step 3: Python inference driver
 

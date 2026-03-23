@@ -29,7 +29,7 @@ INTERMEDIATE = 16
 VOCAB        = 64
 ARCH         = "qwen2moe"
 
-REAL_MODEL_PATH = Path(r"C:\Users\gustr\_models\Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf")
+REAL_MODEL_PATH = Path(r"C:\Users\gustr\_models\Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf")
 
 
 # ── synthetic GGUF factory ─────────────────────────────────────────────────────

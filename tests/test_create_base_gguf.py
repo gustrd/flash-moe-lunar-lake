@@ -30,14 +30,24 @@ def test_base_gguf_size_positive(base_gguf):
     assert base_gguf.stat().st_size > 0
 
 
-def test_no_expert_tensors_in_base(base_gguf):
-    """The base GGUF must not contain any expert tensor data."""
+def test_expert_stubs_present_and_minimal(base_gguf, synthetic_model):
+    """Expert tensors must be present as minimal 4-byte F32 stubs."""
     reader = gguf.GGUFReader(str(base_gguf))
-    expert_names = [t.name for t in reader.tensors
-                    if "ffn_gate_exps" in t.name
-                    or "ffn_up_exps" in t.name
-                    or "ffn_down_exps" in t.name]
-    assert expert_names == [], f"Found expert tensors: {expert_names}"
+    stub_names = [t.name for t in reader.tensors
+                  if "ffn_gate_exps" in t.name
+                  or "ffn_up_exps" in t.name
+                  or "ffn_down_exps" in t.name]
+    orig_manifest = inspect_gguf(synthetic_model.gguf_path)
+    expected_expert_names = {t["name"] for t in orig_manifest["expert_tensors"]}
+    assert set(stub_names) == expected_expert_names, (
+        f"Expert stub names mismatch: got {set(stub_names)}, expected {expected_expert_names}"
+    )
+    # Verify stubs are minimal (4 bytes = single F32)
+    for t in reader.tensors:
+        if t.name in expected_expert_names:
+            assert t.n_bytes == 4, (
+                f"Expert stub {t.name} should be 4 bytes, got {t.n_bytes}"
+            )
 
 
 def test_non_expert_tensors_present(base_gguf, synthetic_model):
@@ -116,9 +126,23 @@ def test_expert_count_kv_preserved(base_gguf):
     assert int(f.parts[f.data[0]][0]) == N_EXPERTS
 
 
-def test_base_smaller_than_original(base_gguf, synthetic_model):
-    base_size = base_gguf.stat().st_size
+def test_base_contains_all_tensors(base_gguf, synthetic_model):
+    """model_base.gguf must contain both non-expert tensors and expert stubs."""
+    orig_manifest = inspect_gguf(synthetic_model.gguf_path)
+    all_expected  = {t["name"] for t in orig_manifest["tensors"]}
+
+    reader = gguf.GGUFReader(str(base_gguf))
+    actual = {t.name for t in reader.tensors}
+
+    missing = all_expected - actual
+    assert not missing, f"Tensors missing from base GGUF: {missing}"
+
+
+def test_base_gguf_smaller_than_original(base_gguf, synthetic_model):
+    """model_base.gguf should be significantly smaller than the original
+    because expert stubs are minimal (4 bytes) instead of full-size."""
     orig_size = synthetic_model.gguf_path.stat().st_size
+    base_size = base_gguf.stat().st_size
     assert base_size < orig_size, (
         f"Base GGUF ({base_size}) should be smaller than original ({orig_size})"
     )
