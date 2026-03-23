@@ -7,6 +7,9 @@
 > **OS**: Windows 11
 > **Constraint**: Zero swap writes. All SSD I/O must be explicit, read-only, controlled by our code.
 > **Goal**: Prove the flash-moe SSD expert streaming technique on x86/Windows/Vulkan, then scale to DeepSeek V3.2.
+> **Language**: Python is the primary implementation language for all tools, engine logic, and orchestration. C is used only where Windows API calls are unavoidable and cannot be driven from Python (e.g. `FILE_FLAG_NO_BUFFERING` via ctypes). Prefer ctypes/cffi over writing new C source files.
+> **llama.cpp**: Managed as a git submodule (`vendor/llama.cpp`). Use official pre-built release binaries (downloaded via script) wherever possible. Compile from source only when a required feature is missing from the release build.
+> **Input model**: Must be a pre-quantized `.gguf` file (e.g. `Qwen3-30B-A3B-Q4_K_M.gguf`). We do **not** quantize models ourselves. The user downloads the GGUF from HuggingFace (e.g. bartowski/Qwen_Qwen3-30B-A3B-GGUF) and provides its path. No float16/bfloat16 safetensors → GGUF conversion is in scope.
 
 ---
 
@@ -134,9 +137,11 @@ Three layers of defense, in order of importance:
 
 ### 3.1 Objective
 
-Create a Python tool that splits a GGUF file into:
+Create a Python tool that splits a **pre-quantized GGUF file** (provided by the user, e.g. `Qwen3-30B-A3B-Q4_K_M.gguf` downloaded from HuggingFace) into:
 - `model_base.gguf` — All non-expert tensors (attention, embeddings, norms, routing weights)
 - `experts/` directory — One binary file per expert per layer, 4K-aligned, ready for direct I/O
+
+**No quantization step**: the input GGUF is already quantized (Q4_K_M, Q2_K, etc.). We extract tensors verbatim — their quantization format is preserved as-is.
 
 ### 3.2 Prerequisites
 
@@ -239,49 +244,52 @@ python -c "import gguf; print(gguf.__version__)"
 
 ### 4.1 Objective
 
-Implement three standalone C modules that can be tested independently:
-- **Expert Cache** (LRU, fixed memory budget)
-- **Expert I/O Pool** (async Windows file reads, 4K-aligned)
-- **Expert Dispatcher** (routing decision → cache lookup → I/O dispatch → compute handoff)
+Implement three modules in Python, tested independently:
+- **Expert Cache** (LRU, fixed memory budget) — pure Python with `mmap`/`bytearray` backing
+- **Expert I/O Pool** (async Windows file reads, 4K-aligned) — Python calling Windows API via `ctypes`
+- **Expert Dispatcher** (routing decision → cache lookup → I/O dispatch → compute handoff) — pure Python
+
+**Language policy**: All modules are Python. The I/O pool calls `CreateFile`, `ReadFile`, `VirtualAlloc`, and `WaitForMultipleObjects` through `ctypes.windll` / `ctypes.WinDLL` — no separate C source files unless a specific call is proven impossible from Python (document the reason if so).
 
 ### 4.2 Prerequisites
 
 ```bash
-# Windows SDK (for CreateFile, ReadFile, VirtualAlloc, OVERLAPPED)
-# CMake 3.20+
-# C compiler (MSVC or clang-cl)
-# No external dependencies beyond Windows API and standard C
+pip install numpy
+# Python 3.11+ (ctypes.windll available on Windows by default)
+# No CMake, no C compiler required
 ```
 
 ### 4.3 Module 1: Expert Cache
 
 ```
-File: expert_cache.h / expert_cache.c
+File: expert_cache.py
 ```
 
 Data structures:
-- Hash map: `(layer, expert_id) → CacheEntry*` — O(1) lookup
-- Doubly-linked list for LRU ordering
-- Memory pool using `VirtualAlloc(MEM_COMMIT | MEM_RESERVE)`
+- `OrderedDict`: `(layer, expert_id) → bytes` — O(1) lookup with LRU promotion via `move_to_end`
+- Explicit `used_bytes` counter; evict from front when over budget
 
 API:
-```c
-ExpertCache*  expert_cache_create(size_t max_bytes);
-void          expert_cache_destroy(ExpertCache* cache);
-void*         expert_cache_get(ExpertCache* cache, uint32_t layer, uint32_t expert_id, size_t* out_size);
-void*         expert_cache_put(ExpertCache* cache, uint32_t layer, uint32_t expert_id, const void* data, size_t size);
-void          expert_cache_clear(ExpertCache* cache);
-size_t        expert_cache_used(ExpertCache* cache);
-float         expert_cache_hit_rate(ExpertCache* cache);
-// Stats
-uint64_t      expert_cache_hits(ExpertCache* cache);
-uint64_t      expert_cache_misses(ExpertCache* cache);
+```python
+class ExpertCache:
+    def __init__(self, max_bytes: int): ...
+    def get(self, layer: int, expert_id: int) -> bytes | None: ...
+    def put(self, layer: int, expert_id: int, data: bytes) -> None: ...
+    def clear(self) -> None: ...
+    @property
+    def used_bytes(self) -> int: ...
+    @property
+    def hit_rate(self) -> float: ...
+    @property
+    def hits(self) -> int: ...
+    @property
+    def misses(self) -> int: ...
 ```
 
 Implementation notes:
-- `expert_cache_put` evicts LRU entries until space is available. Eviction calls `VirtualFree` — **never writes to disk**.
-- Hash map uses open addressing with `(layer * 128 + expert_id)` as key. Total slots = 48 × 128 = 6,144 — small enough for a flat array.
-- All internal allocations via `VirtualAlloc` for alignment and working set guarantees.
+- `put` evicts LRU entries until space is available. Eviction simply removes from the dict — **never writes to disk**.
+- Key is `(layer, expert_id)` tuple; total unique keys = 48 × 128 = 6,144 — trivially small for a dict.
+- Data stored as `bytes` objects (immutable, ref-counted). No manual memory management needed.
 
 - [ ] Implement `expert_cache_create` / `expert_cache_destroy`
 - [ ] Implement `expert_cache_get` (LRU promotion on hit)
@@ -308,34 +316,34 @@ Implementation notes:
 ### 4.4 Module 2: Expert I/O Pool
 
 ```
-File: expert_io.h / expert_io.c
+File: expert_io.py
 ```
 
 API:
-```c
-ExpertIOPool*  expert_io_create(const char* experts_dir, const char* index_json_path);
-void           expert_io_destroy(ExpertIOPool* pool);
+```python
+class ExpertIOPool:
+    def __init__(self, experts_dir: str, index_json_path: str): ...
 
-// Submit K read requests. Non-blocking.
-int  expert_io_submit(ExpertIOPool* pool, uint32_t layer, 
-                      const uint32_t* expert_ids, int K);
+    # Submit K read requests. Non-blocking. Returns immediately.
+    def submit(self, layer: int, expert_ids: list[int]) -> None: ...
 
-// Wait for all submitted reads to complete. Returns pointers to data buffers.
-int  expert_io_wait(ExpertIOPool* pool, void** out_buffers, size_t* out_sizes, int K);
+    # Wait for all submitted reads. Returns list of bytes objects.
+    def wait(self) -> list[bytes]: ...
 
-// Stats
-double expert_io_avg_latency_ms(ExpertIOPool* pool);
-uint64_t expert_io_total_bytes_read(ExpertIOPool* pool);
+    @property
+    def avg_latency_ms(self) -> float: ...
+    @property
+    def total_bytes_read(self) -> int: ...
 ```
 
 Implementation notes:
-- Opens expert files with `CreateFile(FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN)`.
-- Allocates K read buffers with `VirtualAlloc` (4K-aligned).
-- Uses `OVERLAPPED` structs with manual-reset events for async I/O.
-- `expert_io_wait` calls `WaitForMultipleObjects`.
-- Reads are rounded up to next 4096-byte boundary.
-- After read, closes file handle (or uses a handle pool for reuse).
+- Uses `ctypes.windll.kernel32` to call `CreateFileW` with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`.
+- Allocates 4K-aligned read buffers via `ctypes.windll.kernel32.VirtualAlloc`.
+- Issues overlapped reads with `OVERLAPPED` structs created in Python via `ctypes.Structure`.
+- `wait()` calls `WaitForMultipleObjects` via ctypes.
+- Reads are rounded up to the next 4096-byte boundary (required by `FILE_FLAG_NO_BUFFERING`).
 - Loads `expert_index.json` at init to map `(layer, expert_id)` → file path and size.
+- If any specific Windows call proves impossible from ctypes, isolate it in a minimal `io_helpers.c` shim (document why).
 
 - [ ] Implement `expert_io_create`: load index, allocate buffers
 - [ ] Implement `expert_io_submit`: open files, issue async reads
@@ -364,33 +372,27 @@ Implementation notes:
 ### 4.5 Module 3: Expert Dispatcher
 
 ```
-File: expert_dispatch.h / expert_dispatch.c
+File: expert_dispatch.py
 ```
 
 API:
-```c
-ExpertDispatcher* expert_dispatch_create(ExpertCache* cache, ExpertIOPool* io);
-void              expert_dispatch_destroy(ExpertDispatcher* dispatcher);
+```python
+from dataclasses import dataclass
 
-// Given routing results (K expert IDs for a layer), return pointers to expert data.
-// Tries cache first. On miss, reads from SSD via I/O pool.
-int expert_dispatch_get(
-    ExpertDispatcher* dispatcher,
-    uint32_t layer,
-    const uint32_t* expert_ids,
-    int K,
-    void** out_data,       // Array of K data pointers
-    size_t* out_sizes      // Array of K sizes
-);
+@dataclass
+class DispatchStats:
+    cache_hits: int
+    cache_misses: int
+    io_latency_ms: float
 
-// Per-layer stats
-typedef struct {
-    int cache_hits;
-    int cache_misses;
-    double io_latency_ms;
-} DispatchStats;
+class ExpertDispatcher:
+    def __init__(self, cache: ExpertCache, io: ExpertIOPool): ...
 
-DispatchStats expert_dispatch_stats(ExpertDispatcher* dispatcher, uint32_t layer);
+    # Given routing results (K expert IDs for a layer), return list of bytes.
+    # Tries cache first. On miss, reads from SSD via I/O pool.
+    def get(self, layer: int, expert_ids: list[int]) -> list[bytes]: ...
+
+    def stats(self, layer: int) -> DispatchStats: ...
 ```
 
 Implementation:
@@ -451,84 +453,87 @@ If pending batch is non-empty:
 
 ### 5.1 Objective
 
-Modify llama.cpp to use the streaming engine for MoE expert weights instead of loading them from the GGUF via mmap. The result is a working inference binary that:
+Use the pre-built llama.cpp release binary to run inference while our Python streaming engine pre-populates the expert weights. The result is a working inference pipeline that:
 - Loads `model_base.gguf` (non-expert weights) into RAM via `--no-mmap --mlock`
-- Streams expert weights from `experts/` directory via the dispatcher
-- Runs inference end-to-end with Vulkan for attention and CPU for expert math
+- Streams expert weights from `experts/` directory via the Python dispatcher
+- Drives the llama.cpp subprocess from Python for full end-to-end control
 
-### 5.2 Approach: minimal fork
-
-Rather than a deep rewrite, we intercept at the tensor loading layer:
-
-1. **Modified model loading**: When loading the GGUF, expert tensors are not loaded into memory. They are registered in the expert index but their `data` pointers are left null.
-
-2. **Modified MoE compute**: In the MoE forward pass, after routing selects K=8 experts, instead of reading from pre-loaded tensor data, we call `expert_dispatch_get()` to obtain pointers (from cache or SSD).
-
-3. **Modified memory management**: Expert tensor memory is managed by our cache, not by llama.cpp's mmap/malloc.
-
-### 5.3 Key files to modify in llama.cpp
+### 5.2 llama.cpp setup: submodule + pre-built binaries
 
 ```
-src/llama-model.cpp    — Model loading: skip expert tensor data
-src/llama-graph.cpp    — Graph building: inject dispatch calls before MoE ops
-src/llama-context.cpp  — Context init: create cache + I/O pool + dispatcher
-ggml/src/ggml-cpu/     — CPU backend: expert matmul reads from dispatched buffers
+vendor/llama.cpp/   — git submodule (pinned to a known stable tag)
+vendor/bin/         — pre-built Windows Vulkan release binaries (downloaded by setup.py)
 ```
 
-### 5.4 Step-by-step
+**Policy**: Download the official GitHub release zip (e.g., `llama-<tag>-bin-win-vulkan-x64.zip`) via `setup.py`. Unzip into `vendor/bin/`. The submodule is present for source reference and as a fallback build path, but we do **not** compile by default. Only compile from source if a required feature is absent from the release build, and document the reason.
 
-#### Step 1: Build unmodified llama.cpp with Vulkan
+```
+setup.py            — downloads correct llama.cpp release zip, verifies SHA256, extracts to vendor/bin/
+```
 
-- [ ] Clone llama.cpp at a known stable tag
-- [ ] Build with Vulkan: `cmake -B build -DGGML_VULKAN=ON && cmake --build build --config Release`
-- [ ] Verify baseline: `llama-bench -m Qwen3-30B-A3B-Q4_K_M.gguf -ngl 99 -p 512 -n 128`
+### 5.3 Approach: Python wrapper around llama.cpp binary
+
+Rather than patching C++ source, use llama.cpp's existing expert CPU-offload feature combined with our Python engine:
+
+1. **Expert pre-loading**: Our Python dispatcher pre-fetches expert weights into a shared memory region or temp files before each layer's compute.
+
+2. **Server/subprocess mode**: Drive `llama-server` or `llama-cli` via subprocess, using the `--override-tensor` or `--tensor-split` flags to route expert layers to CPU.
+
+3. **Fallback — minimal C patch**: If the above is insufficient, write the smallest possible patch to `llama.cpp` source (document each change) and build via CMake only in that case.
+
+### 5.4 Key interactions with llama.cpp binary
+
+```
+vendor/bin/llama-cli.exe    — run inference via subprocess
+vendor/bin/llama-bench.exe  — baseline benchmarks
+vendor/bin/llama-server.exe — optional HTTP API mode
+```
+
+### 5.5 Step-by-step
+
+#### Step 1: Obtain llama.cpp binaries
+
+- [ ] Write `setup.py`: fetch latest Vulkan release zip from `https://github.com/ggml-org/llama.cpp/releases`, verify SHA256, extract to `vendor/bin/`
+- [ ] Add `vendor/llama.cpp` as a git submodule pinned to the same tag as the downloaded binaries
+- [ ] Verify baseline: `vendor/bin/llama-bench.exe -m Qwen3-30B-A3B-Q4_K_M.gguf -ngl 99 -p 512 -n 128`
 - [ ] Record baseline tok/s (pp and tg)
 
-#### Step 2: Build with streaming engine linked
+#### Step 2: Python inference driver
 
-- [ ] Add `expert_cache.c`, `expert_io.c`, `expert_dispatch.c` to the CMake build
-- [ ] Add Windows libs: `kernel32.lib` (for file I/O and memory APIs)
-- [ ] Verify it compiles without linking errors
+- [ ] Write `inference_driver.py`: wraps `llama-cli.exe` subprocess, parses stdout token stream
+- [ ] Accept `--experts-dir`, `--cache-gb`, `--model-base` arguments
+- [ ] Before launching subprocess, call `SetProcessWorkingSetSize` via ctypes
 
-#### Step 3: Modified model loading
+#### Step 3: Expert weight injection
 
-- [ ] In `llama_model_load()`, detect expert tensors by name pattern
-- [ ] For expert tensors: record metadata (shape, dtype) but do NOT allocate or read data
-- [ ] For all other tensors: load normally (with `--no-mmap --mlock`)
-- [ ] Initialize `ExpertDispatcher` with the experts/ directory path
+- [ ] Investigate whether `llama-cli.exe` `--no-mmap --mlock` + expert CPU offload flags suffice to load `model_base.gguf` without expert data
+- [ ] If yes: Python dispatcher pre-stages expert files; llama.cpp reads them normally
+- [ ] If no: write minimal C patch, build from submodule source, document why binary was insufficient
 
-#### Step 4: Modified MoE forward pass
+#### Step 4: Memory management
 
-- [ ] In `build_moe_ffn()` (or equivalent), after routing produces K expert IDs:
-  - Call `expert_dispatch_get(layer, expert_ids, K, &data_ptrs, &sizes)`
-  - Set each expert's tensor data pointer to the dispatched buffer
-  - Proceed with normal matmul operations
-- [ ] After MoE compute completes for the layer, data pointers remain valid (owned by cache)
-
-#### Step 5: Memory management hooks
-
-- [ ] At engine startup: `SetProcessWorkingSetSize(20GB, 26GB)`
-- [ ] At engine startup: create ExpertCache with `max_bytes = available_ram - base_usage`
-- [ ] At engine shutdown: `expert_cache_destroy` (frees all VirtualAlloc'd memory)
+- [ ] At engine startup (Python): call `SetProcessWorkingSetSize(20GB, 26GB)` via ctypes on the llama.cpp subprocess handle
+- [ ] Monitor committed memory via `psutil` during inference
 
 **Test: `test_integration_llamacpp.py`** (end-to-end, uses subprocess)
 ```
-- [ ] Smoke test: generate 10 tokens with streaming engine. 
+- [ ] setup.py: vendor/bin/llama-cli.exe exists and prints version without error
+- [ ] Smoke test: generate 10 tokens with streaming engine.
       Output is coherent English (not garbage).
-- [ ] Determinism: generate same prompt twice with same seed. 
+- [ ] Determinism: generate same prompt twice with same seed.
       Output matches.
-- [ ] Correctness: generate 50 tokens with streaming engine. 
-      Compare against baseline (full GGUF) output. 
+- [ ] Correctness: generate 50 tokens with streaming engine.
+      Compare against baseline (full GGUF) output.
       Outputs must be identical (same quantized weights, same compute).
       If not identical, investigate: may be floating point ordering differences.
       Relaxed check: first 10 tokens must match.
-- [ ] Memory: during inference, committed memory stays under 28 GB.
-- [ ] Disk writes: monitor SSD write counter. Zero writes from our process 
+- [ ] Memory: during inference, committed memory stays under 28 GB (psutil).
+- [ ] Disk writes: monitor SSD write counter. Zero writes from our process
       during entire inference run.
 - [ ] Cold start: first token latency with empty cache.
 - [ ] Warm steady state: tok/s after 50 tokens (cache populated).
-- [ ] Expert offload config: run with --no-mmap --mlock and 
-      experts loaded via streaming. Verify all attention on GPU (Vulkan), 
+- [ ] Expert offload config: run with --no-mmap --mlock and
+      experts loaded via streaming. Verify all attention on GPU (Vulkan),
       all expert compute on CPU.
 ```
 
