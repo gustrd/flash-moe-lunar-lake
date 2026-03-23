@@ -3,13 +3,14 @@
 
 > **Hardware**: Intel Lunar Lake, 32 GB LPDDR5X on-package, Arc 140V iGPU (Xe2, 64 EUs)
 > **Model**: Qwen3-30B-A3B (30.5B total, 3.3B active, 128 experts/layer, K=8, 48 layers)
+> **Baseline model**: `Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf` (locally available at `C:\Users\gustr\_models\`)
 > **Backend**: llama.cpp with Vulkan (confirmed working)
 > **OS**: Windows 11
 > **Constraint**: Zero swap writes. All SSD I/O must be explicit, read-only, controlled by our code.
 > **Goal**: Prove the flash-moe SSD expert streaming technique on x86/Windows/Vulkan, then scale to DeepSeek V3.2.
 > **Language**: Python is the primary implementation language for all tools, engine logic, and orchestration. C is used only where Windows API calls are unavoidable and cannot be driven from Python (e.g. `FILE_FLAG_NO_BUFFERING` via ctypes). Prefer ctypes/cffi over writing new C source files.
 > **llama.cpp**: Managed as a git submodule (`vendor/llama.cpp`). Use official pre-built release binaries (downloaded via script) wherever possible. Compile from source only when a required feature is missing from the release build.
-> **Input model**: Must be a pre-quantized `.gguf` file (e.g. `Qwen3-30B-A3B-Q4_K_M.gguf`). We do **not** quantize models ourselves. The user downloads the GGUF from HuggingFace (e.g. bartowski/Qwen_Qwen3-30B-A3B-GGUF) and provides its path. No float16/bfloat16 safetensors → GGUF conversion is in scope.
+> **Input model**: Must be a pre-quantized `.gguf` file (e.g. `Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf`). We do **not** quantize models ourselves. The user downloads the GGUF from HuggingFace and provides its path. No float16/bfloat16 safetensors → GGUF conversion is in scope.
 
 ---
 
@@ -24,7 +25,7 @@
 7. [Phase 3 — Optimizations](#7-phase-3--optimizations)
 8. [Scaling Path to DeepSeek V3.2](#8-scaling-path-to-deepseek-v32)
 9. [Reference Materials](#9-reference-materials)
-10. [Questions for Future Choices](#10-questions-for-future-choices)
+10. [Architectural Decisions (Resolved)](#10-architectural-decisions-resolved)
 
 ---
 
@@ -446,12 +447,46 @@ If pending batch is non-empty:
 
 ### 5.1 Objective
 
-Use the pre-built llama.cpp release binary to run inference while our Python streaming engine pre-populates the expert weights. The result is a working inference pipeline that:
-- Loads `model_base.gguf` (non-expert weights) into RAM via `--no-mmap --mlock`
-- Streams expert weights from `experts/` directory via the Python dispatcher
-- Drives the llama.cpp subprocess from Python for full end-to-end control
+Build a working inference pipeline that produces valid text output by combining two llama.cpp instances with the Python streaming engine.
 
-### 5.2 llama.cpp setup: submodule + pre-built binaries
+**Success criterion (Phase 2C)**: The engine produces valid, coherent text output. Performance is not measured in this phase — that is Phase 2D.
+
+### 5.2 Architecture: Two-Instance Design
+
+Phase 2C uses **two separate llama.cpp processes**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Two-Instance Pipeline                      │
+│                                                               │
+│  ┌──────────────────────┐      ┌───────────────────────────┐ │
+│  │  Instance A          │      │  Instance B               │ │
+│  │  "Router"            │─────►│  "Inferencer"             │ │
+│  │                      │      │                           │ │
+│  │  Runs: model_base    │      │  Runs: model_base +       │ │
+│  │  Purpose: determine  │      │  selected expert weights  │ │
+│  │  which K experts are │      │  Purpose: full token      │ │
+│  │  active this layer   │      │  generation with experts  │ │
+│  └──────────────────────┘      └───────────────────────────┘ │
+│             │                              ▲                  │
+│             │  expert IDs [k0..k7]         │                  │
+│             ▼                              │                  │
+│  ┌──────────────────────────────────────┐ │                  │
+│  │  Python Dispatcher                   │─┘                  │
+│  │  Cache → I/O Pool → expert bytes     │                    │
+│  └──────────────────────────────────────┘                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Instance A (Expert Selector)**: Runs `model_base.gguf` and executes the routing computation (attention + MoE gate projection) to determine which K=8 experts are active per layer. Each selected expert is emitted as a **fixed, unique token** — expert N always maps to the same reserved token T_N. The only data transmitted from Instance A to the Python orchestrator per layer is K token IDs (small integers). No raw activations or tensor data crosses the process boundary.
+
+**Python Orchestrator**: Receives the K token IDs from Instance A, maps them to expert files via `expert_index.json` (O(1) lookup), and loads the expert bytes using the `ExpertDispatcher` (cache-first, SSD fallback).
+
+**Instance B (Inferencer)**: Receives the K expert weight payloads from the Python orchestrator and performs the full forward pass for the current layer. Expert weights are injected before each layer's FFN computation.
+
+**Fixed and unique expert tokens**: Each expert (layer, expert_id) pair is assigned a dedicated token ID at extraction time and recorded in `expert_index.json`. This one-to-one mapping is static and deterministic — the same expert always produces the same token, and the same token always identifies the same expert. This makes the inter-instance communication minimal (K integers per layer) and makes the routing side-channel easy to parse.
+
+### 5.3 llama.cpp setup: submodule + pre-built binaries
 
 ```
 vendor/llama.cpp/   — git submodule (pinned to a known stable tag)
@@ -464,17 +499,23 @@ vendor/bin/         — pre-built Windows Vulkan release binaries (downloaded by
 setup.py            — downloads correct llama.cpp release zip, verifies SHA256, extracts to vendor/bin/
 ```
 
-### 5.3 Approach: Python wrapper around llama.cpp binary
+### 5.4 Output directory convention
 
-Rather than patching C++ source, use llama.cpp's existing expert CPU-offload feature combined with our Python engine:
+Extraction outputs live **alongside the source GGUF**:
 
-1. **Expert pre-loading**: Our Python dispatcher pre-fetches expert weights into a shared memory region or temp files before each layer's compute.
+```
+C:\Users\gustr\_models\
+  Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf   ← input (read-only)
+  Qwen3-30B-A3B-Instruct-2507-Q4_K_M\
+    model_base.gguf                           ← non-expert base
+    expert_index.json                         ← offset index
+    experts\
+      blk00_exp000.bin ... blk47_exp127.bin   ← 6144 expert files
+```
 
-2. **Server/subprocess mode**: Drive `llama-server` or `llama-cli` via subprocess, using the `--override-tensor` or `--tensor-split` flags to route expert layers to CPU.
+All scripts accept `--output-dir` to override this default. `inference_driver.py` auto-discovers the output directory by appending `\<model_stem>\` to the GGUF path.
 
-3. **Fallback — minimal C patch**: If the above is insufficient, write the smallest possible patch to `llama.cpp` source (document each change) and build via CMake only in that case.
-
-### 5.4 Key interactions with llama.cpp binary
+### 5.5 Key interactions with llama.cpp binary
 
 ```
 vendor/bin/llama-cli.exe    — run inference via subprocess
@@ -482,64 +523,59 @@ vendor/bin/llama-bench.exe  — baseline benchmarks
 vendor/bin/llama-server.exe — optional HTTP API mode
 ```
 
-### 5.5 Step-by-step
+### 5.6 Step-by-step
 
 #### Step 1: Obtain llama.cpp binaries
 
 - [ ] Write `setup.py`: fetch latest Vulkan release zip from `https://github.com/ggml-org/llama.cpp/releases`, verify SHA256, extract to `vendor/bin/`
 - [ ] Add `vendor/llama.cpp` as a git submodule pinned to the same tag as the downloaded binaries
-- [ ] Verify baseline: `vendor/bin/llama-bench.exe -m Qwen3-30B-A3B-Q4_K_M.gguf -ngl 99 -p 512 -n 128`
-- [ ] Record baseline tok/s (pp and tg)
+- [ ] Verify baseline: `vendor/bin/llama-bench.exe -m <baseline_gguf> -ngl 99 -p 512 -n 128`
+- [ ] Record baseline tok/s (pp and tg) against `Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf`
 
-#### Step 2: Python inference driver
+#### Step 2: Determine expert injection mechanism
 
-- [ ] Write `inference_driver.py`: wraps `llama-cli.exe` subprocess, parses stdout token stream
-- [ ] Accept `--experts-dir`, `--cache-gb`, `--model-base` arguments
-- [ ] Before launching subprocess, call `SetProcessWorkingSetSize` via ctypes
+Before writing `inference_driver.py`, determine whether the binary supports loading `model_base.gguf` (missing expert tensors) without crashing:
 
-#### Step 3: Expert weight injection
+- [ ] Test: run `llama-cli.exe --model model_base.gguf` — does it error on missing expert tensors?
+- [ ] If it crashes: update `create_base_gguf.py` to include zero-filled expert stub tensors
+- [ ] If stubs needed: write the smallest possible patch to llama.cpp to overwrite stub tensors with dispatcher-provided data at inference time; document why
+- [ ] Decision gate: document chosen injection path before proceeding to Step 3
 
-- [ ] Investigate whether `llama-cli.exe` `--no-mmap --mlock` + expert CPU offload flags suffice to load `model_base.gguf` without expert data
-- [ ] If yes: Python dispatcher pre-stages expert files; llama.cpp reads them normally
-- [ ] If no: write minimal C patch, build from submodule source, document why binary was insufficient
+#### Step 3: Python inference driver
+
+- [ ] Write `inference_driver.py`: orchestrates both llama.cpp instances
+- [ ] Instance A: extracts routing decisions (expert IDs per layer) via stdout parsing or shared memory
+- [ ] Instance B: receives expert bytes from Python dispatcher and performs full inference
+- [ ] Accept `--model-gguf`, `--cache-gb` arguments; derive `experts-dir` and `model-base` automatically from `--model-gguf`
+- [ ] Before launching subprocesses, call `SetProcessWorkingSetSize` via ctypes
 
 #### Step 4: Memory management
 
-- [ ] At engine startup (Python): call `SetProcessWorkingSetSize(20GB, 26GB)` via ctypes on the llama.cpp subprocess handle
+- [ ] At engine startup: call `SetProcessWorkingSetSize(20GB, 26GB)` via ctypes
 - [ ] Monitor committed memory via `psutil` during inference
 
 **Test: `test_integration_llamacpp.py`** (end-to-end, uses subprocess)
 ```
 - [ ] setup.py: vendor/bin/llama-cli.exe exists and prints version without error
+- [ ] Baseline check: llama-bench.exe runs against full GGUF, produces tok/s numbers
 - [ ] Smoke test: generate 10 tokens with streaming engine.
-      Output is coherent English (not garbage).
+      Output is coherent text (not garbage bytes or crash).
 - [ ] Determinism: generate same prompt twice with same seed.
-      Output matches.
+      Token output matches exactly.
+- [ ] Expert determinism: given the same input activation, the same expert
+      always produces the same output (verified via hash of output tensors).
 - [ ] Correctness: generate 50 tokens with streaming engine.
-      Compare against baseline (full GGUF) output.
-      Outputs must be identical (same quantized weights, same compute).
-      If not identical, investigate: may be floating point ordering differences.
-      Relaxed check: first 10 tokens must match.
+      First 10 tokens match baseline (full GGUF) output.
+      (Floating-point ordering differences in later tokens are acceptable.)
 - [ ] Memory: during inference, committed memory stays under 28 GB (psutil).
-- [ ] Disk writes: monitor SSD write counter. Zero writes from our process
-      during entire inference run.
-- [ ] Cold start: first token latency with empty cache.
-- [ ] Warm steady state: tok/s after 50 tokens (cache populated).
-- [ ] Expert offload config: run with --no-mmap --mlock and
-      experts loaded via streaming. Verify all attention on GPU (Vulkan),
-      all expert compute on CPU.
+- [ ] Disk writes: zero SSD writes from our process during entire inference run.
 ```
 
 ### Integration test for Phase 2C
 
 ```
-- [ ] Long generation (500 tokens): no crashes, no memory growth,
-      coherent output throughout.
-- [ ] Chat mode: multi-turn conversation (3 turns),
-      verify context is maintained correctly.
-- [ ] Compare tok/s: streaming engine vs baseline (full GGUF in RAM).
-      Expected: streaming with warm cache ≈ baseline (within 10%).
-      Cold cache ≈ 50-80% of baseline (I/O overhead).
+- [ ] Long generation (500 tokens): no crashes, no memory growth, coherent output.
+- [ ] Chat mode: multi-turn conversation (3 turns), context maintained correctly.
 ```
 
 ---
@@ -602,6 +638,15 @@ For each configuration, run: `prompt="Explain quantum computing in detail" token
 ## 7. Phase 3 — Optimizations
 
 Execute only after Phase 2 is complete and validated.
+
+### 7.0 I/O engine hardening (deferred from Phase 2B)
+
+These are correctness-neutral optimizations that should be done before Phase 2D benchmark numbers are published:
+
+- **Handle pooling**: Add `dict[(layer, exp_id) → HANDLE]` to `ExpertIOPool`. Open on first access, keep open until `destroy()`. Reduces `CreateFileW` overhead by 20-50% for small expert files.
+- **`WaitForMultipleObjects`**: Replace the sequential `WaitForSingleObject` loop in `ExpertIOPool.wait()` with a single `WaitForMultipleObjects(K, handles, waitAll=True)` call. Achieves true parallel I/O completion. 64-handle limit is fine for K=8.
+
+Both changes are isolated to `expert_io.py` and require no changes to the cache or dispatcher.
 
 ### 7.1 Prefetch speculation
 
@@ -723,96 +768,76 @@ Usable for batch/offline processing. Not interactive, but functional.
 
 ---
 
-## 10. Questions for Future Choices
+## 10. Architectural Decisions (Resolved)
 
-These questions must be answered before Phase 2C work begins. They represent architectural forks where the wrong choice wastes significant time.
-
----
-
-### Q1: Which exact GGUF file will be used for Phase 2C testing?
-
-The real model available locally is `Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf` (a heavily quantized 35B model). The plan was written for `Qwen3-30B-A3B-Q4_K_M.gguf`.
-
-**Options:**
-- **A** — Use the existing `Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf` (already available, starts Phase 2C immediately)
-- **B** — Download `Qwen3-30B-A3B-Q4_K_M.gguf` from HuggingFace before Phase 2C (matches the plan, larger/better quality but needs ~18 GB download)
-- **C** — Use a smaller MoE model for initial integration testing (e.g., a quantized Mixtral 8x7B), then switch to Qwen3 for benchmarks
-
-**Why it matters**: `IQ3_XXS` is an unusual quantization type; `model_base.gguf` reconstruction and llama.cpp loading behavior may differ from a standard `Q4_K_M`.
+These decisions were made before Phase 2C work began.
 
 ---
 
-### Q2: How should expert weight injection work in Phase 2C?
+### Q1 — Which GGUF file is the baseline? ✅ RESOLVED
 
-The core unsolved question: llama.cpp needs to compute expert FFN layers, but the expert weights live in our `experts/` directory, not in `model_base.gguf`.
-
-**Options:**
-- **A — Shared memory / named pipe**: Python dispatcher writes current-layer expert weights into a named shared memory region; llama.cpp reads from it via a small hook/patch. Requires minimal C patch.
-- **B — Temp file swap**: Before each layer, Python pre-copies the K active expert files to fixed-name temp files that `model_base.gguf` references (requires expert stubs in base GGUF). Slower, but zero C code.
-- **C — llama.cpp `--override-tensor` flag**: Use llama.cpp's existing mechanism to redirect tensor loads per-request. Investigation needed to confirm this is granular enough for per-token expert switching.
-- **D — llama-cpp-python binding**: Use the Python bindings (`llama-cpp-python`) to call into llama.cpp's C API directly, intercepting the expert weight load callback. More control, but requires a specific build.
-
-**Why it matters**: This is the critical integration point. Option A requires C code (contradicts language policy unless minimal). Options B/C/D are pure Python but may have unacceptable latency or not be possible.
+**Decision**: Use `Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf` (locally available at `C:\Users\gustr\_models\`). This is the Phase 2C and 2D baseline. The previously available `Qwen3.5-35B-A3B-UD-IQ3_XXS.gguf` is no longer used.
 
 ---
 
-### Q3: Should `model_base.gguf` contain expert stubs (zero tensors) or omit experts entirely?
+### Q2 — How are expert weights injected into llama.cpp? ✅ RESOLVED
 
-Currently `create_base_gguf.py` omits expert tensors entirely. llama.cpp may refuse to load a GGUF where expected tensors are missing.
+**Decision**: Two separate llama.cpp instances.
 
-**Options:**
-- **A — Keep current behavior** (omit experts): Only works if we find an injection mechanism (Q2) that doesn't require tensors to exist in the GGUF at load time. If llama.cpp errors on missing expert tensors, this path is blocked.
-- **B — Add zero-filled stubs**: Expert tensors present in `model_base.gguf` but filled with zeros. llama.cpp loads normally; we overwrite the in-memory weights at inference time. Requires knowing the memory address of each expert tensor in llama.cpp's model struct.
-- **C — Add stub tensors pointing to expert files**: Modify llama.cpp to read expert tensors from our `expert_index.json` paths instead of from the GGUF mmap. Requires a C patch but is the cleanest long-term approach.
+- **Instance A (Expert Selector)**: Runs `model_base.gguf` to compute routing. Each selected expert is emitted as a fixed, unique token — the only inter-process data is K token IDs per layer.
+- **Instance B (Inferencer)**: Receives K expert weight payloads from the Python orchestrator and runs the full forward pass with those weights.
 
-**Why it matters**: The answer determines whether `create_base_gguf.py` needs to be modified, and constrains Q2's options.
+No shared memory patches, no temp-file swaps, no `--override-tensor` investigation needed.
 
 ---
 
-### Q4: What is the target performance metric for Phase 2C success?
+### Q3 — How does the Expert Selector communicate selected experts? ✅ RESOLVED
 
-We need a definition of "working" to know when Phase 2C is done.
+**Decision**: Each expert (layer, expert_id) is assigned a **fixed, unique reserved token** at extraction time. Instance A emits that token when an expert is selected. Instance B receives K tokens per layer, maps them to expert files via `expert_index.json`, and loads the corresponding weights.
 
-**Options:**
-- **A — Correctness only**: Streaming engine produces identical token output to baseline (same prompt, same seed, same quantized weights). Performance doesn't matter yet.
-- **B — Correctness + non-zero tok/s**: Streaming engine produces correct output AND achieves at least 0.5 tok/s (any speed is acceptable as long as it works).
-- **C — Correctness + within 50% of baseline**: More ambitious; requires the streaming pipeline to be reasonably efficient, not just functional.
+Benefits:
+- Inter-instance communication is minimal: K small integers per layer.
+- The mapping is static and deterministic — same expert always → same token.
+- No raw activations or tensor data cross the process boundary.
+- Enables future output-level caching (same token + same input → same output, by construction of quantized weights).
 
-**Why it matters**: Option A is achievable even with naive temp-file swapping. Option C may require the async I/O pipeline (Phase 3.1 prefetch) to be implemented concurrently with Phase 2C.
-
----
-
-### Q5: Handle pooling in `ExpertIOPool` — implement now or defer?
-
-`ExpertIOPool` currently opens a new file handle per read and closes it in `_cleanup_pending`. Keeping handles open would reduce `CreateFileW` overhead but adds complexity (handle invalidation on file changes, etc.).
-
-**Options:**
-- **A — Defer to Phase 3**: Keep current open-per-read behavior. Implement handle pooling as a Phase 3 optimization after correctness is proven.
-- **B — Implement now**: Add a `dict[(layer, exp_id) → HANDLE]` pool. Open on first access, keep open until `destroy()`. Benchmark improvement before committing.
-
-**Why it matters**: Low risk either way. But doing it now is clean since we're already touching `ExpertIOPool`. The decision affects Phase 2D benchmark results (handle pooling can reduce latency by 20-50% for small files).
+The `expert_index.json` is extended to include a `token_id` field per expert. `extract_experts.py` assigns token IDs during extraction (e.g., sequential integers starting beyond the model's actual vocabulary).
 
 ---
 
-### Q6: What to do about the `WaitForMultipleObjects` optimization?
+### Q4 — What is Phase 2C success? ✅ RESOLVED
 
-Current `expert_io.py` calls `WaitForSingleObject` in a sequential loop (waits for expert 0, then expert 1, etc.). The correct approach for maximum parallelism is `WaitForMultipleObjects(K, handles, waitAll=True)`, which waits for all K reads simultaneously.
-
-**Options:**
-- **A — Keep sequential wait**: Simpler, correct, but doesn't exploit async overlap between reads. Fine if K ≤ 8 and SSD queue depth handles it.
-- **B — Switch to `WaitForMultipleObjects`**: Better parallelism but `WaitForMultipleObjects` has a 64-handle limit. For K=8 this is fine. Implement before Phase 2D benchmarks.
-
-**Why it matters**: The benchmark in Phase 2D will measure I/O latency. Using sequential `WaitForSingleObject` may inflate measured latency vs true parallel completion time. Should be fixed before publishing benchmark numbers.
+**Decision**: Correctness only. The engine must produce valid, coherent text output. Performance is not measured until Phase 2D.
 
 ---
 
-### Q7: Where should the Phase 2A extraction outputs live on disk?
+### Q5 — Handle pooling in `ExpertIOPool`? ✅ RESOLVED
 
-Currently the tests use `tmp_path_factory` (pytest temp dirs). For real model use, we need a stable output location.
+**Decision**: Defer to Phase 3. Current open-per-read behavior is kept for Phase 2C and 2D. Handle pooling is a listed Phase 3 optimization.
 
-**Options:**
-- **A — Alongside the GGUF**: `C:\Users\gustr\_models\Qwen3.5-35B-A3B-UD-IQ3_XXS\experts\` and `model_base.gguf` in the same directory. Convenient but adds ~13 GB next to the model.
-- **B — Project directory**: `c:\Users\gustr\_git\flash-moe-lunar-lake\data\experts\`. Keeps workspace self-contained but on the same SSD volume as code.
-- **C — Configurable via CLI flag**: `extract_experts.py --output-dir <path>`. Most flexible; no hardcoded assumption.
+---
 
-**Why it matters**: Phase 2C `setup.py` and `inference_driver.py` need to know where to find `experts/` and `model_base.gguf`. The convention needs to be established before writing those scripts.
+### Q6 — `WaitForMultipleObjects` vs sequential wait? ✅ RESOLVED
+
+**Decision**: Keep sequential `WaitForSingleObject`. Noted as a Phase 3 optimization:
+> Phase 3.x: Switch `ExpertIOPool.wait()` from sequential `WaitForSingleObject` to `WaitForMultipleObjects(K, handles, waitAll=True)` for true parallel I/O completion. 64-handle limit is fine for K=8.
+
+This should be implemented before Phase 2D benchmarks are published.
+
+---
+
+### Q7 — Where do extraction outputs live? ✅ RESOLVED
+
+**Decision**: Alongside the source GGUF, in a subdirectory named after the model stem:
+
+```
+C:\Users\gustr\_models\
+  Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
+  Qwen3-30B-A3B-Instruct-2507-Q4_K_M\
+    model_base.gguf
+    expert_index.json
+    experts\
+      blk00_exp000.bin ... blk47_exp127.bin
+```
+
+All extraction scripts accept `--output-dir` to override. `inference_driver.py` auto-derives the output directory from the `--model-gguf` path.
